@@ -10,7 +10,7 @@ from werkzeug.utils import secure_filename
 app = Flask(__name__)
 
 # ============================================================
-# UPLOAD CONFIGURATION
+# CONFIGURATION
 # ============================================================
 
 UPLOAD_FOLDER = "uploads"
@@ -18,8 +18,31 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-# Stores the most recently uploaded video
+ALLOWED_EXTENSIONS = {
+    "mp4",
+    "mov",
+    "avi",
+    "mkv",
+    "webm"
+}
+
+# Process every Nth frame.
+# 1 = every frame
+# 2 = every second frame (faster)
+FRAME_SKIP = 2
+
+# Maximum number of alerts stored
+MAX_ALERTS = 8
+
+
+# ============================================================
+# GLOBAL VIDEO STATE
+# ============================================================
+
 latest_uploaded_video = None
+
+video_lock = threading.Lock()
+
 
 # ============================================================
 # AI ENGINE
@@ -27,6 +50,11 @@ latest_uploaded_video = None
 
 ai_engine = None
 ai_lock = threading.Lock()
+
+
+# ============================================================
+# CAMERAS
+# ============================================================
 
 CAMERAS = [
     {
@@ -46,8 +74,13 @@ CAMERAS = [
         "name": "Sector C-4",
         "type": "Checkpoint",
         "status": "ONLINE"
-    },
+    }
 ]
+
+
+# ============================================================
+# ALERTS
+# ============================================================
 
 alert_types = [
     "Perimeter Intrusion",
@@ -73,6 +106,11 @@ alerts = [
     }
 ]
 
+
+# ============================================================
+# LIVE METRICS
+# ============================================================
+
 metrics = {
     "fps": 30,
     "humans": 1,
@@ -91,50 +129,137 @@ def now_time():
     return datetime.now().strftime("%I:%M:%S %p")
 
 
+def allowed_file(filename):
+    if not filename:
+        return False
+
+    if "." not in filename:
+        return False
+
+    extension = filename.rsplit(".", 1)[1].lower()
+
+    return extension in ALLOWED_EXTENSIONS
+
+
+# ============================================================
+# ALERT CREATION
+# ============================================================
+
+def add_alert(
+    alert_type,
+    sector,
+    details,
+    confidence=None
+):
+
+    item = {
+        "type": alert_type,
+        "sector": sector,
+        "details": details,
+        "confidence": confidence,
+        "time": now_time()
+    }
+
+    alerts.insert(0, item)
+
+    del alerts[MAX_ALERTS:]
+
+    return item
+
+
+# ============================================================
+# LOAD AI DETECTOR
+# ============================================================
+
+def load_ai():
+
+    global ai_engine
+
+    with ai_lock:
+
+        if ai_engine is not None:
+            return ai_engine
+
+        try:
+
+            from detection.human_vehicle_detector import (
+                HumanVehicleDetector
+            )
+
+            detector = HumanVehicleDetector()
+
+            ai_engine = {
+                "detector": detector
+            }
+
+            print("----------------------------------------")
+            print("[AI] HumanVehicleDetector loaded")
+            print("[AI] YOLO tracking is enabled")
+            print("----------------------------------------")
+
+            return ai_engine
+
+        except Exception as exc:
+
+            print("----------------------------------------")
+            print("[AI ERROR] Could not load detector")
+            print("[AI ERROR]", exc)
+            print("----------------------------------------")
+
+            return None
+
+
 # ============================================================
 # DEMO FRAME
 # ============================================================
 
 def make_demo_frame(camera_id="A3"):
-    """
-    Generate a demo CCTV frame so the website works
-    even when no real camera/video is being used.
-    """
-
-    w, h = 960, 540
 
     import numpy as np
 
-    frame = np.zeros((h, w, 3), dtype="uint8")
+    width = 960
+    height = 540
+
+    frame = np.zeros(
+        (height, width, 3),
+        dtype="uint8"
+    )
+
     frame[:] = (8, 12, 22)
 
     # Grid
-    for x in range(0, w, 40):
+    for x in range(0, width, 40):
+
         cv2.line(
             frame,
             (x, 0),
-            (x, h),
+            (x, height),
             (22, 31, 46),
             1
         )
 
-    for y in range(0, h, 40):
+    for y in range(0, height, 40):
+
         cv2.line(
             frame,
             (0, y),
-            (w, y),
+            (width, y),
             (22, 31, 46),
             1
         )
 
     cam = next(
-        (c for c in CAMERAS if c["id"] == camera_id),
+        (
+            c for c in CAMERAS
+            if c["id"] == camera_id
+        ),
         CAMERAS[0]
     )
 
+    # Header
     cv2.putText(
         frame,
-        f"LIVE  |  {cam['name']} ({cam['type']})",
+        f"LIVE | {cam['name']} ({cam['type']})",
         (24, 35),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.75,
@@ -152,8 +277,11 @@ def make_demo_frame(camera_id="A3"):
         1
     )
 
-    # Demo target
-    bx, by, bw, bh = 390, 150, 150, 230
+    # Demo person
+    bx = 390
+    by = 150
+    bw = 150
+    bh = 230
 
     cv2.rectangle(
         frame,
@@ -173,7 +301,7 @@ def make_demo_frame(camera_id="A3"):
 
     cv2.putText(
         frame,
-        "PERSON  94.2%  ID:17",
+        "PERSON 94.2% ID:17",
         (bx + 6, by - 7),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.46,
@@ -200,11 +328,11 @@ def make_demo_frame(camera_id="A3"):
         1
     )
 
-    # Bottom information bar
+    # Bottom metrics
     cv2.rectangle(
         frame,
-        (20, h - 48),
-        (w - 20, h - 18),
+        (20, height - 48),
+        (width - 20, height - 18),
         (4, 8, 16),
         -1
     )
@@ -215,7 +343,7 @@ def make_demo_frame(camera_id="A3"):
         f"VEHICLES: {metrics['vehicles']}   "
         f"TRACKS: {metrics['tracks']}   "
         f"FPS: {metrics['fps']}",
-        (30, h - 27),
+        (30, height - 27),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.48,
         (210, 220, 235),
@@ -226,57 +354,21 @@ def make_demo_frame(camera_id="A3"):
 
 
 # ============================================================
-# AI LOADER
-# ============================================================
-
-def load_ai():
-    global ai_engine
-
-    with ai_lock:
-
-        if ai_engine is not None:
-            return ai_engine
-
-        try:
-
-            from detection.human_vehicle_detector import HumanVehicleDetector
-            from anpr.anpr_pipeline import ANPRPipeline
-            from suspicious.pose_detector import SuspiciousPoseDetector
-
-            detector = HumanVehicleDetector()
-
-            ai_engine = {
-                "detector": detector,
-                "anpr": None,
-                "suspicious": SuspiciousPoseDetector()
-            }
-
-            ai_engine["anpr"] = ANPRPipeline(detector)
-
-            print("[AI] AI engine loaded successfully")
-
-            return ai_engine
-
-        except Exception as exc:
-
-            print("[AI MODE ERROR]", exc)
-
-            return None
-
-
-# ============================================================
-# JPEG STREAM HELPER
+# ENCODE FRAME
 # ============================================================
 
 def encode_frame(frame):
 
-    ok, jpg = cv2.imencode(
+    success, jpg = cv2.imencode(
         ".jpg",
         frame,
-        [int(cv2.IMWRITE_JPEG_QUALITY), 82]
+        [
+            int(cv2.IMWRITE_JPEG_QUALITY),
+            82
+        ]
     )
 
-    if not ok:
+    if not success:
         return None
 
     return (
@@ -288,7 +380,7 @@ def encode_frame(frame):
 
 
 # ============================================================
-# DEMO VIDEO STREAM
+# DEMO STREAM
 # ============================================================
 
 def generate_demo_stream(camera_id):
@@ -309,42 +401,65 @@ def generate_demo_stream(camera_id):
 # RAW VIDEO STREAM
 # ============================================================
 
-def generate_raw_video_stream(video_path, camera_id):
+def generate_raw_video_stream(
+    video_path,
+    camera_id
+):
 
-    print("[VIDEO] Opening uploaded video:", video_path)
+    print("[VIDEO] Opening:", video_path)
 
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
 
-        print("[VIDEO ERROR] Could not open uploaded video")
+        print("[VIDEO ERROR] Cannot open video")
 
         yield from generate_demo_stream(camera_id)
 
         return
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    source_fps = cap.get(
+        cv2.CAP_PROP_FPS
+    )
 
-    if not fps or fps <= 0:
-        fps = 25
+    if not source_fps or source_fps <= 0:
+        source_fps = 25
 
-    delay = 1 / min(fps, 30)
+    # Don't intentionally make video slower
+    delay = 1 / min(source_fps, 30)
 
     while True:
 
-        ok, frame = cap.read()
+        success, frame = cap.read()
 
-        if not ok:
+        if not success:
 
-            # Restart video when it reaches the end
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            # Restart video
+            cap.set(
+                cv2.CAP_PROP_POS_FRAMES,
+                0
+            )
 
-            ok, frame = cap.read()
+            success, frame = cap.read()
 
-            if not ok:
+            if not success:
                 break
 
-        # Add small IBVAP label
+        # Resize only if video is extremely large
+        height, width = frame.shape[:2]
+
+        if width > 1280:
+
+            scale = 1280 / width
+
+            frame = cv2.resize(
+                frame,
+                (
+                    int(width * scale),
+                    int(height * scale)
+                )
+            )
+
         cv2.putText(
             frame,
             "IBVAP AI ANALYTICS",
@@ -379,266 +494,330 @@ def generate_raw_video_stream(video_path, camera_id):
 # AI VIDEO STREAM
 # ============================================================
 
-def generate_ai_stream(source, camera_id):
+def generate_ai_stream(
+    video_path,
+    camera_id
+):
 
     engine = load_ai()
 
     # --------------------------------------------------------
-    # If AI modules are unavailable, still show uploaded video
-    # instead of falling back to the fake demo screen.
+    # If detector could not load
     # --------------------------------------------------------
 
     if engine is None:
 
-        print("[AI] AI modules unavailable.")
+        print(
+            "[AI] Detector unavailable."
+        )
 
-        if source and os.path.exists(str(source)):
-
-            print("[AI] Showing uploaded video without AI processing.")
+        # Still show the uploaded video
+        if (
+            video_path
+            and os.path.exists(video_path)
+        ):
 
             yield from generate_raw_video_stream(
-                source,
+                video_path,
                 camera_id
             )
 
         else:
 
-            yield from generate_demo_stream(camera_id)
+            yield from generate_demo_stream(
+                camera_id
+            )
 
         return
 
     # --------------------------------------------------------
-    # Open video
+    # Open uploaded video
     # --------------------------------------------------------
 
-    try:
-
-        if str(source).isdigit():
-            cap = cv2.VideoCapture(int(source))
-        else:
-            cap = cv2.VideoCapture(source)
-
-    except Exception as exc:
-
-        print("[VIDEO OPEN ERROR]", exc)
-
-        yield from generate_demo_stream(camera_id)
-
-        return
+    cap = cv2.VideoCapture(
+        video_path
+    )
 
     if not cap.isOpened():
 
-        print("[VIDEO ERROR] Video source could not be opened.")
+        print(
+            "[VIDEO ERROR] "
+            "Could not open uploaded video."
+        )
 
-        if source and os.path.exists(str(source)):
-            yield from generate_raw_video_stream(
-                source,
-                camera_id
-            )
-        else:
-            yield from generate_demo_stream(camera_id)
+        yield from generate_demo_stream(
+            camera_id
+        )
 
         return
 
+    source_fps = cap.get(
+        cv2.CAP_PROP_FPS
+    )
+
+    if not source_fps or source_fps <= 0:
+        source_fps = 25
+
+    frame_number = 0
+
+    last_tracked_objects = []
+
+    last_process_time = time.time()
+
     # --------------------------------------------------------
-    # Processing loop
+    # VIDEO LOOP
     # --------------------------------------------------------
-
-    frame_count = 0
-
-    fps_value = cap.get(cv2.CAP_PROP_FPS)
-
-    if not fps_value or fps_value <= 0:
-        fps_value = 25
 
     while True:
 
-        ok, frame = cap.read()
+        success, frame = cap.read()
 
-        if not ok:
+        # ----------------------------------------------------
+        # Restart when video ends
+        # ----------------------------------------------------
 
-            # Restart video
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        if not success:
 
-            ok, frame = cap.read()
+            print(
+                "[VIDEO] Restarting uploaded video..."
+            )
 
-            if not ok:
+            cap.set(
+                cv2.CAP_PROP_POS_FRAMES,
+                0
+            )
+
+            # Reset detector tracking state
+            try:
+
+                detector = engine["detector"]
+
+                if hasattr(
+                    detector.model,
+                    "predictor"
+                ):
+
+                    detector.model.predictor = None
+
+            except Exception:
+                pass
+
+            frame_number = 0
+
+            success, frame = cap.read()
+
+            if not success:
                 break
 
-        frame_count += 1
+        frame_number += 1
+
+        # ----------------------------------------------------
+        # Resize very large videos
+        # ----------------------------------------------------
+
+        height, width = frame.shape[:2]
+
+        if width > 1280:
+
+            scale = 1280 / width
+
+            frame = cv2.resize(
+                frame,
+                (
+                    int(width * scale),
+                    int(height * scale)
+                )
+            )
+
+        # ----------------------------------------------------
+        # YOLO DETECTION
+        # ----------------------------------------------------
+
+        should_process = (
+            frame_number % FRAME_SKIP == 0
+        )
+
+        if should_process:
+
+            try:
+
+                detector = engine["detector"]
+
+                tracked_objects = (
+                    detector.process_frame(frame)
+                )
+
+                last_tracked_objects = (
+                    tracked_objects
+                )
+
+                # --------------------------------------------
+                # Count humans
+                # --------------------------------------------
+
+                humans = sum(
+                    obj.category == "human"
+                    for obj in tracked_objects
+                )
+
+                # --------------------------------------------
+                # Count vehicles
+                # --------------------------------------------
+
+                vehicles = sum(
+                    obj.category == "vehicle"
+                    for obj in tracked_objects
+                )
+
+                # --------------------------------------------
+                # Count tracks
+                # --------------------------------------------
+
+                tracks = len(
+                    tracked_objects
+                )
+
+                metrics.update({
+
+                    "humans": humans,
+
+                    "vehicles": vehicles,
+
+                    "tracks": tracks,
+
+                    "fps": int(
+                        source_fps
+                    )
+
+                })
+
+                # --------------------------------------------
+                # Print useful debugging info
+                # --------------------------------------------
+
+                if frame_number % 30 == 0:
+
+                    print(
+                        f"[YOLO] "
+                        f"Frame={frame_number} "
+                        f"Humans={humans} "
+                        f"Vehicles={vehicles} "
+                        f"Tracks={tracks}"
+                    )
+
+            except Exception as exc:
+
+                print(
+                    "[YOLO FRAME ERROR]",
+                    exc
+                )
+
+        # ----------------------------------------------------
+        # DRAW DETECTIONS
+        # ----------------------------------------------------
 
         try:
 
-            # ------------------------------------------------
-            # HUMAN / VEHICLE DETECTION
-            # ------------------------------------------------
+            detector = engine["detector"]
 
-            tracked = engine["detector"].process_frame(frame)
-
-            # ------------------------------------------------
-            # ANPR
-            # ------------------------------------------------
-
-            engine["anpr"].process_frame(
-                frame,
-                tracked
-            )
-
-            # ------------------------------------------------
-            # SUSPICIOUS ACTIVITY
-            # ------------------------------------------------
-
-            pose_alert = engine["suspicious"].process_frame(frame)
-
-            # ------------------------------------------------
-            # DRAW DETECTIONS
-            # ------------------------------------------------
-
-            annotated = engine["detector"].annotate_frame(
-                frame,
-                tracked
-            )
-
-            # ------------------------------------------------
-            # METRICS
-            # ------------------------------------------------
-
-            humans = sum(
-                o.category == "human"
-                for o in tracked
-            )
-
-            vehicles = sum(
-                o.category == "vehicle"
-                for o in tracked
-            )
-
-            metrics.update({
-                "humans": humans,
-                "vehicles": vehicles,
-                "tracks": len(tracked),
-                "fps": int(fps_value)
-            })
-
-            # ------------------------------------------------
-            # SUSPICIOUS ACTIVITY ALERT
-            # ------------------------------------------------
-
-            if pose_alert:
-
-                camera_name = next(
-                    (
-                        c["name"]
-                        for c in CAMERAS
-                        if c["id"] == camera_id
-                    ),
-                    camera_id
+            annotated = (
+                detector.annotate_frame(
+                    frame,
+                    last_tracked_objects
                 )
-
-                add_alert(
-                    "Suspicious Activity",
-                    camera_name,
-                    "Pose anomaly detected",
-                    88.0
-                )
-
-                cv2.rectangle(
-                    annotated,
-                    (10, 10),
-                    (430, 55),
-                    (0, 0, 255),
-                    -1
-                )
-
-                cv2.putText(
-                    annotated,
-                    "ALERT: SUSPICIOUS ACTIVITY",
-                    (20, 42),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (255, 255, 255),
-                    2
-                )
-
-            # ------------------------------------------------
-            # IBVAP LABEL
-            # ------------------------------------------------
-
-            cv2.putText(
-                annotated,
-                "IBVAP AI ANALYTICS",
-                (20, 85),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (70, 220, 170),
-                2
             )
 
         except Exception as exc:
 
-            print("[AI FRAME ERROR]", exc)
-
-            cv2.putText(
-                frame,
-                "AI processing error",
-                (20, 100),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 0, 255),
-                2
+            print(
+                "[ANNOTATION ERROR]",
+                exc
             )
 
-            annotated = frame
+            annotated = frame.copy()
 
         # ----------------------------------------------------
-        # SEND FRAME TO BROWSER
+        # IBVAP INFORMATION
         # ----------------------------------------------------
 
-        data = encode_frame(annotated)
+        cv2.putText(
+            annotated,
+            "IBVAP AI ANALYTICS",
+            (20, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (70, 220, 170),
+            2
+        )
+
+        cv2.putText(
+            annotated,
+            "YOLO HUMAN / VEHICLE DETECTION",
+            (20, 65),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1
+        )
+
+        # ----------------------------------------------------
+        # Bottom metrics
+        # ----------------------------------------------------
+
+        height, width = annotated.shape[:2]
+
+        cv2.rectangle(
+            annotated,
+            (15, height - 50),
+            (width - 15, height - 15),
+            (5, 10, 20),
+            -1
+        )
+
+        cv2.putText(
+            annotated,
+            f"HUMANS: {metrics['humans']}   "
+            f"VEHICLES: {metrics['vehicles']}   "
+            f"TRACKS: {metrics['tracks']}",
+            (25, height - 27),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (220, 230, 240),
+            1
+        )
+
+        # ----------------------------------------------------
+        # Encode
+        # ----------------------------------------------------
+
+        data = encode_frame(
+            annotated
+        )
 
         if data:
             yield data
 
-        time.sleep(.03)
+        # ----------------------------------------------------
+        # DON'T ADD AN EXTRA .03 SECOND DELAY
+        # ----------------------------------------------------
+        #
+        # YOLO processing itself controls the speed.
+        # Adding another sleep here was making the feed slower.
+        #
 
     cap.release()
 
 
 # ============================================================
-# ALERT SYSTEM
-# ============================================================
-
-def add_alert(
-    alert_type,
-    sector,
-    details,
-    confidence=None
-):
-
-    item = {
-        "type": alert_type,
-        "sector": sector,
-        "details": details,
-        "confidence": confidence,
-        "time": now_time()
-    }
-
-    alerts.insert(0, item)
-
-    # Keep only latest 8 alerts
-    del alerts[8:]
-
-    return item
-
-
-# ============================================================
-# MAIN PAGE
+# HOME PAGE
 # ============================================================
 
 @app.route("/")
 def index():
 
-    return render_template("index.html")
+    return render_template(
+        "index.html"
+    )
 
 
 # ============================================================
@@ -648,7 +827,9 @@ def index():
 @app.get("/api/cameras")
 def api_cameras():
 
-    return jsonify(CAMERAS)
+    return jsonify(
+        CAMERAS
+    )
 
 
 # ============================================================
@@ -661,18 +842,28 @@ def api_dashboard():
     return jsonify({
 
         "system": {
-            "feeds": len(CAMERAS),
-            "latency": metrics["latency"],
+
+            "feeds": len(
+                CAMERAS
+            ),
+
+            "latency": metrics[
+                "latency"
+            ],
+
             "mode": "prototype"
+
         },
 
         "metrics": metrics,
 
         "alerts": alerts,
 
-        "timestamp": datetime.now().isoformat(
-            timespec="seconds"
-        )
+        "timestamp":
+            datetime.now().isoformat(
+                timespec="seconds"
+            )
+
     })
 
 
@@ -683,20 +874,40 @@ def api_dashboard():
 @app.post("/api/demo-alert")
 def api_demo_alert():
 
-    camera = (
-        request.json.get("sector", "Sector A-3")
-        if request.is_json
-        else "Sector A-3"
-    )
+    if request.is_json:
+
+        camera = request.json.get(
+            "sector",
+            "Sector A-3"
+        )
+
+    else:
+
+        camera = "Sector A-3"
 
     item = add_alert(
-        random.choice(alert_types),
+
+        random.choice(
+            alert_types
+        ),
+
         camera,
+
         "AI event generated for demonstration",
-        round(random.uniform(82, 98), 1)
+
+        round(
+            random.uniform(
+                82,
+                98
+            ),
+            1
+        )
+
     )
 
-    return jsonify(item)
+    return jsonify(
+        item
+    )
 
 
 # ============================================================
@@ -709,112 +920,159 @@ def upload_video():
     global latest_uploaded_video
 
     # --------------------------------------------------------
-    # Check file
+    # Check request
     # --------------------------------------------------------
 
     if "video" not in request.files:
 
         return jsonify({
-            "error": "No video file was uploaded."
+
+            "error":
+                "No video file was uploaded."
+
         }), 400
 
-    file = request.files["video"]
+    file = request.files[
+        "video"
+    ]
 
-    if file.filename == "":
+    # --------------------------------------------------------
+    # Check filename
+    # --------------------------------------------------------
+
+    if not file.filename:
 
         return jsonify({
-            "error": "No video file selected."
+
+            "error":
+                "No video file selected."
+
         }), 400
 
+    filename = secure_filename(
+        file.filename
+    )
+
     # --------------------------------------------------------
-    # Allowed extensions
+    # Check extension
     # --------------------------------------------------------
 
-    allowed_extensions = {
-        "mp4",
-        "mov",
-        "avi",
-        "mkv",
-        "webm"
-    }
-
-    filename = secure_filename(file.filename)
-
-    extension = filename.rsplit(".", 1)[-1].lower()
-
-    if extension not in allowed_extensions:
+    if not allowed_file(
+        filename
+    ):
 
         return jsonify({
-            "error": "Unsupported video format."
+
+            "error":
+                "Unsupported video format. "
+                "Use MP4, MOV, AVI, MKV or WEBM."
+
         }), 400
 
     # --------------------------------------------------------
-    # Save file
+    # Create unique filename
     # --------------------------------------------------------
 
     timestamp = datetime.now().strftime(
         "%Y%m%d_%H%M%S"
     )
 
-    filename = f"{timestamp}_{filename}"
+    filename = (
+        timestamp
+        + "_"
+        + filename
+    )
 
     filepath = os.path.join(
-        app.config["UPLOAD_FOLDER"],
+        app.config[
+            "UPLOAD_FOLDER"
+        ],
         filename
     )
 
+    # --------------------------------------------------------
+    # Save video
+    # --------------------------------------------------------
+
     try:
 
-        file.save(filepath)
+        file.save(
+            filepath
+        )
 
     except Exception as exc:
 
-        print("[UPLOAD ERROR]", exc)
+        print(
+            "[UPLOAD ERROR]",
+            exc
+        )
 
         return jsonify({
-            "error": "Could not save uploaded video."
+
+            "error":
+                "Could not save uploaded video."
+
         }), 500
 
     # --------------------------------------------------------
     # Verify video
     # --------------------------------------------------------
 
-    test_cap = cv2.VideoCapture(filepath)
+    cap = cv2.VideoCapture(
+        filepath
+    )
 
-    if not test_cap.isOpened():
+    if not cap.isOpened():
 
-        test_cap.release()
+        cap.release()
 
         try:
-            os.remove(filepath)
+            os.remove(
+                filepath
+            )
         except Exception:
             pass
 
         return jsonify({
-            "error": "The uploaded file is not a valid video."
+
+            "error":
+                "Uploaded file is not a valid video."
+
         }), 400
 
     width = int(
-        test_cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        cap.get(
+            cv2.CAP_PROP_FRAME_WIDTH
+        )
     )
 
     height = int(
-        test_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        cap.get(
+            cv2.CAP_PROP_FRAME_HEIGHT
+        )
     )
 
-    fps = test_cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(
+        cv2.CAP_PROP_FPS
+    )
 
     frame_count = int(
-        test_cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        cap.get(
+            cv2.CAP_PROP_FRAME_COUNT
+        )
     )
 
-    test_cap.release()
+    cap.release()
 
     # --------------------------------------------------------
-    # Remember latest uploaded video
+    # Store latest video
     # --------------------------------------------------------
 
-    latest_uploaded_video = filepath
+    with video_lock:
+
+        latest_uploaded_video = (
+            filepath
+        )
 
     print("----------------------------------------")
     print("[UPLOAD SUCCESS]")
@@ -830,8 +1088,6 @@ def upload_video():
 
         "filename": filename,
 
-        "path": filepath,
-
         "width": width,
 
         "height": height,
@@ -840,7 +1096,9 @@ def upload_video():
 
         "frames": frame_count,
 
-        "message": "Video uploaded successfully."
+        "message":
+            "Video uploaded successfully."
+
     })
 
 
@@ -864,43 +1122,46 @@ def video_feed():
     )
 
     # --------------------------------------------------------
-    # If AI mode is requested and an uploaded video exists,
-    # automatically use that uploaded video.
+    # AI MODE
     # --------------------------------------------------------
 
     if mode == "ai":
 
-        if latest_uploaded_video:
+        with video_lock:
 
-            if os.path.exists(latest_uploaded_video):
+            uploaded_video = (
+                latest_uploaded_video
+            )
 
-                source = latest_uploaded_video
+        # ----------------------------------------------------
+        # Use uploaded video
+        # ----------------------------------------------------
 
-                print(
-                    "[VIDEO FEED] Using uploaded video:",
-                    source
-                )
+        if (
+            uploaded_video
+            and os.path.exists(
+                uploaded_video
+            )
+        ):
 
-            else:
+            generator = generate_ai_stream(
 
-                print(
-                    "[VIDEO FEED] Uploaded video no longer exists."
-                )
+                uploaded_video,
 
-                source = "0"
+                camera_id
+
+            )
 
         else:
 
-            # No upload yet
-            source = request.args.get(
-                "source",
-                "0"
+            # No uploaded video
+            generator = generate_demo_stream(
+                camera_id
             )
 
-        generator = generate_ai_stream(
-            source,
-            camera_id
-        )
+    # --------------------------------------------------------
+    # DEMO MODE
+    # --------------------------------------------------------
 
     else:
 
@@ -909,9 +1170,34 @@ def video_feed():
         )
 
     return Response(
+
         generator,
-        mimetype="multipart/x-mixed-replace; boundary=frame"
+
+        mimetype=
+            "multipart/x-mixed-replace; "
+            "boundary=frame"
+
     )
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.get("/health")
+def health():
+
+    return jsonify({
+
+        "status": "online",
+
+        "ai_loaded":
+            ai_engine is not None,
+
+        "video_uploaded":
+            latest_uploaded_video is not None
+
+    })
 
 
 # ============================================================
@@ -921,12 +1207,16 @@ def video_feed():
 if __name__ == "__main__":
 
     app.run(
+
         host="0.0.0.0",
+
         port=int(
             os.environ.get(
                 "PORT",
                 5000
             )
         ),
+
         debug=False
+
     )
